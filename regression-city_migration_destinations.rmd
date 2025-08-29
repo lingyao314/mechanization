@@ -1,0 +1,242 @@
+---
+title: "Migration regressions"
+author: Ling Yao
+date: 10/24/2023
+output: html_notebook
+---
+This file runs the regressions of migration destination city non-agricultural employment on ag mechanization in the top migrant origin cities. Destination cities and origin cities are matched using the China Migrants Dynamic Survey 2017 data. Ag mechanization and its IV are the weighted sum of the origin cities with migrant inflow as weights.
+
+```{r, warning = F, message = F}
+library(dplyr)
+library(feather)
+library(AER)
+library(stargazer)
+library(plm)
+library(ggplot2)
+library(readstata13)
+library(tidyverse)
+```
+
+# load outcome data
+```{r}
+employment_city <- arrow::read_feather("dataprocessing/output/employment_city.feather") %>%
+  select(year, period, city_code, prv_code, nonag, manufacturing, construction, wholesaleretail, accommodationfood, logistic)%>%
+  plm::make.pbalanced(., index = c("city_code", "year")) %>% # make it balanced so the lag is correctly missing when there is a gap in time
+    group_by(city_code) %>%
+    arrange(city_code, year) %>%
+  mutate(nonag_fd = nonag -  dplyr::lag(nonag),
+         manufacturing_fd = manufacturing - dplyr::lag(manufacturing),
+         construction_fd = construction - dplyr::lag(construction),
+         wholesaleretail_fd = wholesaleretail -dplyr::lag(wholesaleretail),
+         accommodationfood_fd = accommodationfood - dplyr::lag(accommodationfood),
+         logistic_fd = logistic - dplyr::lag(logistic))
+  ## the 2020 data is not available. The Chinese gov stopped reporting this information due to employment shocks in the Covid-19 pandemic.
+
+migration <- arrow::read_feather("dataprocessing/output/migration_top5origin.feather") %>%
+    select(dest_city_code, origin_city, counts)%>%
+    filter(!is.na(dest_city_code))
+
+```
+
+```{r prepare-data, warning = F, message = F}
+m_list <- list("power", "tiller", "seeder", "harvester", "corn", "dryer")
+for (m in 1:6){
+  # Load province level machinery subsidy data
+  shock <- arrow::read_feather(paste0("dataprocessing/output/", m_list[[m]], "/shock.feather")) %>%
+    mutate(prv_size = paste(prv_code, "-", size)) %>%
+    plm::make.pbalanced(., index = c("prv_size", "year")) %>% # make it balanced so the lag is correctly missing when there is a gap in time
+    group_by(prv_size) %>%
+    arrange(prv_size, year) %>%
+    mutate(subsidy_fd = subsidy - dplyr::lag(subsidy)) %>%
+    select(prv_code, year, size, subsidy, retail_price, subsidy_rate, subsidy_fd)
+
+  # load city level machinery purchase data
+  city_year <- arrow::read_feather(paste0("dataprocessing/output/", m_list[[m]], "/city_year.feather"))%>%
+    plm::make.pbalanced(., index = c("city_code", "year")) %>% # make it balanced so the lag is correctly missing when there is a gap in time
+    group_by(city_code) %>%
+    arrange(city_code, year) %>%
+    mutate(purchase_fd = purchase - dplyr::lag(purchase)) %>%
+    select(city_code, year, purchase, purchase_fd)
+
+  # Load city-size level shares
+  city_year_size_shares <- arrow::read_feather(paste0("dataprocessing/output/", m_list[[m]], "/city_year_size_shares.feather"))
+
+  mechanization_data <- city_year_size_shares %>%
+    mutate(prv_code = substring(city_code, 0,2))%>%
+    merge(shock, by = c("prv_code", "year", "size"), all.x = TRUE) %>%
+    mutate(exposure_share_L1 = share_L1 * subsidy,
+           exposure_share_L1_fd = share_L1 * subsidy_fd)%>%
+    group_by(city_code, year) %>%
+    summarise(ssiv_share_L1 = sum(exposure_share_L1, na.rm=T),
+              ssiv_share_L1_fd = sum(exposure_share_L1_fd, na.rm=T),
+                sum_shares_L1 = sum(share_L1[subsidy>0], na.rm = T), NAshares = sum(share_L1, na.rm = T))  %>% # sum of the shares of sizes with positive subsidy
+    mutate(ssiv_share_L1 = replace(ssiv_share_L1, NAshares ==0, NA),
+           ssiv_share_L1_fd = replace(ssiv_share_L1_fd, NAshares ==0, NA)) %>%
+    merge(city_year, by = c("city_code", "year"), all.x = T, all.y = T)
+
+    reg_data = data.frame()
+    # merge with migrant origins mechanization with migrant destination year by year
+    for(y in 2016:2019){
+        temp_data <- mutate(migration, year = y) %>%
+                     merge(mechanization_data, by.x = c("origin_city", "year"), by.y = c("city_code", "year"), all.x = T) %>%
+          filter(!is.na( purchase)) %>%
+          filter(!is.na( ssiv_share_L1))  %>%
+          group_by(dest_city_code) %>%
+          mutate(oc_count = n()) %>%
+          filter(oc_count == 5) %>%
+          group_by(dest_city_code) %>%
+          mutate(ssiv_share_L1= weighted.mean(ssiv_share_L1, w= counts, na.rm = T),
+                 ssiv_share_L1_fd= weighted.mean(ssiv_share_L1_fd, w= counts, na.rm = T),
+                 purchase = weighted.mean(purchase, w= counts, na.rm = T),
+                 purchase_fd = weighted.mean(purchase_fd, w= counts, na.rm = T)) %>%
+          distinct(dest_city_code, year, .keep_all = T)
+        reg_data = rbind(reg_data, temp_data)
+        }
+
+        reg_data <-  merge(reg_data, employment_city, by.x = c("dest_city_code", "year"), by.y= c("city_code", "year"), all.x = T) %>% mutate(year = as.factor(year))
+
+    ols <-   lfe::felm(nonag ~ 1 + purchase | 0 | 0| 0 , data= reg_data )
+    tsls <- lfe::felm(nonag ~ 1  | 0 | (purchase ~ ssiv_share_L1)| 0 , data= reg_data ) # 2SLS
+    tsls_tfe <- lfe::felm(nonag ~ 1  | year | (purchase ~ ssiv_share_L1)| 0 , data= reg_data ) # 2SLS with time FE
+    tsls_tfefd <- lfe::felm(nonag_fd ~ 1  | year | (purchase_fd  ~ ssiv_share_L1_fd )| 0 , data= reg_data )# 2SLS with time FE and FD
+
+  # Store the regression results
+  assign(m_list[[m]], list(ols = ols,
+                           tsls = tsls,
+                           tsls_tfe = tsls_tfe,
+                           tsls_tfefd = tsls_tfefd))
+
+}
+
+```
+# look into the results. Only the tractor has strong first stage.
+```{r}
+power$tsls_tfefd$stage1$rob.iv1fstat$purchase_fd[5]
+tiller$tsls_tfefd$stage1$rob.iv1fstat$purchase_fd[5]
+seeder$tsls_tfefd$stage1$rob.iv1fstat$purchase_fd[5]
+harvester$tsls_tfefd$stage1$rob.iv1fstat$purchase_fd[5]
+corn$tsls_tfefd$stage1$rob.iv1fstat$purchase_fd[5]
+dryer$tsls_tfefd$stage1$rob.iv1fstat$purchase_fd[5]
+```
+# Focus on tractor purchase, regression by non-agricultural sectors.
+```{r}
+m <- 1
+  shock <- arrow::read_feather(paste0("dataprocessing/output/", m_list[[m]], "/shock.feather")) %>%
+    mutate(prv_size = paste(prv_code, "-", size)) %>%
+    plm::make.pbalanced(., index = c("prv_size", "year")) %>% # make it balanced so the lag is correctly missing when there is a gap in time
+    group_by(prv_size) %>%
+    arrange(prv_size, year) %>%
+    mutate(subsidy_fd = subsidy - dplyr::lag(subsidy)) %>%
+    select(prv_code, year, size, subsidy, retail_price, subsidy_rate, subsidy_fd)
+
+  # load city level machinery purchase data
+  city_year <- arrow::read_feather(paste0("dataprocessing/output/", m_list[[m]], "/city_year.feather"))%>%
+    plm::make.pbalanced(., index = c("city_code", "year")) %>% # make it balanced so the lag is correctly missing when there is a gap in time
+    group_by(city_code) %>%
+    arrange(city_code, year) %>%
+    mutate(purchase_fd = purchase - dplyr::lag(purchase)) %>%
+    select(city_code, year, purchase, purchase_fd)
+
+  # Load city-size level shares
+  city_year_size_shares <- arrow::read_feather(paste0("dataprocessing/output/", m_list[[m]], "/city_year_size_shares.feather"))
+
+  mechanization_data <- city_year_size_shares %>%
+    mutate(prv_code = substring(city_code, 0,2))%>%
+    merge(shock, by = c("prv_code", "year", "size"), all.x = TRUE) %>%
+    mutate(exposure_share_L1 = share_L1 * subsidy,
+           exposure_share_L1_fd = share_L1 * subsidy_fd)%>%
+    group_by(city_code, year) %>%
+    summarise(ssiv_share_L1 = sum(exposure_share_L1, na.rm=T),
+              ssiv_share_L1_fd = sum(exposure_share_L1_fd, na.rm=T),
+                sum_shares_L1 = sum(share_L1[subsidy>0], na.rm = T), NAshares = sum(share_L1, na.rm = T))  %>% # sum of the shares of sizes with positive subsidy
+    mutate(ssiv_share_L1 = replace(ssiv_share_L1, NAshares ==0, NA),
+           ssiv_share_L1_fd = replace(ssiv_share_L1_fd, NAshares ==0, NA)) %>%
+    merge(city_year, by = c("city_code", "year"), all.x = T, all.y = T)
+
+    reg_data = data.frame()
+    # merge with migrant origins mechanization with migrant destination year by year
+    for(y in 2016:2019){
+        temp_data <- mutate(migration, year = y) %>%
+                     merge(mechanization_data, by.x = c("origin_city", "year"), by.y = c("city_code", "year"), all.x = T) %>%
+          filter(!is.na( purchase)) %>%
+          filter(!is.na( ssiv_share_L1))  %>%
+          group_by(dest_city_code) %>%
+          mutate(oc_count = n()) %>%
+          filter(oc_count == 5) %>%
+          group_by(dest_city_code) %>%
+          mutate(ssiv_share_L1= weighted.mean(ssiv_share_L1, w= counts, na.rm = T),
+                 ssiv_share_L1_fd= weighted.mean(ssiv_share_L1_fd, w= counts, na.rm = T),
+                 purchase = weighted.mean(purchase, w= counts, na.rm = T),
+                 purchase_fd = weighted.mean(purchase_fd, w= counts, na.rm = T)) %>%
+          distinct(dest_city_code, year, .keep_all = T)
+        reg_data = rbind(reg_data, temp_data)
+        }
+
+        reg_data <-  merge(reg_data, employment_city, by.x = c("dest_city_code", "year"), by.y= c("city_code", "year"), all.x = T) %>% mutate(year = as.factor(year)) %>% filter(!if_any(c(nonag_fd, manufacturing_fd,construction_fd, wholesaleretail_fd, accommodationfood_fd, logistic_fd, purchase_fd, ssiv_share_L1_fd), is.na))  %>% distinct(dest_city_code, year,  .keep_all = T)
+
+    tsls_tfefd_all <- lfe::felm(nonag_fd ~ 1  | year | (purchase_fd  ~ ssiv_share_L1_fd )| 0 , data= reg_data )# 2SLS with time FE and FD
+    tsls_tfefd_manufacturing <- lfe::felm(manufacturing_fd ~ 1  | year | (purchase_fd  ~ ssiv_share_L1_fd )| 0 , data= reg_data )# 2SLS with time FE and FD
+    tsls_tfefd_construction <- lfe::felm(construction_fd ~ 1  | year | (purchase_fd  ~ ssiv_share_L1_fd )| 0 , data= reg_data )# 2SLS with time FE and FD
+    tsls_tfefd_wholesaleretail <- lfe::felm(wholesaleretail_fd ~ 1  | year | (purchase_fd  ~ ssiv_share_L1_fd )| 0 , data= reg_data )# 2SLS with time FE and FD
+    tsls_tfefd_accommodationfood <- lfe::felm(accommodationfood_fd ~ 1  | year | (purchase_fd  ~ ssiv_share_L1_fd )| 0 , data= reg_data )# 2SLS with time FE and FD
+    tsls_tfefd_logistic <- lfe::felm(logistic_fd ~ 1  | year | (purchase_fd  ~ ssiv_share_L1_fd )| 0 , data= reg_data )# 2SLS with time FE and FD
+```
+
+
+# Assemble the results into stargazer tables
+
+```{r}
+migration_result <- stargazer(tsls_tfefd_all,
+                              tsls_tfefd_manufacturing,
+                       tsls_tfefd_construction,
+                       tsls_tfefd_wholesaleretail,
+                       tsls_tfefd_accommodationfood,
+                       tsls_tfefd_logistic,
+                       title = "2SLS estimation results for the effect of mechanization on employment by sector in migration destination cities",
+                       align = TRUE,
+                       se = list(summary(tsls_tfefd_all, robust = T)$coefficients[,2],
+                                 summary(tsls_tfefd_manufacturing, robust = T)$coefficients[,2],
+                                          summary(tsls_tfefd_construction, robust = T)$coefficients[,2],
+                                          summary(tsls_tfefd_wholesaleretail, robust = T)$coefficients[,2],
+                                          summary(tsls_tfefd_accommodationfood, robust = T)$coefficients[,2],
+                                          summary(tsls_tfefd_logistic, robust = T)$coefficients[,2]),
+                       out = "regression/output/migration.html",
+                       out.header = TRUE,
+                       column.labels = c("All non-ag sectors", "Manufacturing", "Construction",  "Wholesale and retail", "Hotel and food service", "Logistic"),
+                       dep.var.caption = '\\begin{tabular}{@{}c@{}}Dependent variable: \\\\ Employment by sector in the migtation destination city (1000 people) \\end{tabular}',
+                       dep.var.labels.include = F,
+                       covariate.labels = c("\\begin{tabular}{@{}l@{}}Weighted average of tractor purchase (1000 horsepower) \\\\ in the top 5 migration origin cities \\end{tabular}"),
+                       omit = c("Constant"),
+                       ci = FALSE,
+                       label = "migration",
+                       font.size = "Huge",
+                       df = FALSE,
+                       omit.stat = c("f", "rsq"),
+                       add.lines =  list(c("First stage F stat",
+                                           formatC(tsls_tfefd_all$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f"),
+                                           formatC(tsls_tfefd_manufacturing$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f"),
+                                           formatC(tsls_tfefd_construction$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f"),
+                                           formatC(tsls_tfefd_wholesaleretail$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f"),
+                                           formatC(tsls_tfefd_accommodationfood$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f"),
+                                           formatC(tsls_tfefd_logistic$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f")
+                       ))
+)
+```
+```{r}
+# adjustbox so it fits the page width
+migration_result <- append(migration_result, "\\begin{adjustbox}{width={1.2\\textwidth},totalheight={\\textheight},keepaspectratio, center}", after = grep("label", migration_result)[1])
+migration_result <- append(migration_result, "\\end{adjustbox} \\end{center}", after = grep("tabular", migration_result)[4])
+
+# add footnote
+migration_result[grepl('\\centering', migration_result)] <- "\\begin{table}[!htbp]\\begin{center}"
+migration_result[grepl('Note', migration_result)] <- ""
+notes <- "\\footnotesize{\\textit{Notes:} This table reports the two-stage least squares estimates on the effect of subsidized machinery purchase in the top 5 migration origin cities on the secondary and tertiary employment in the corresponding migration destination cities during 2016 - 2019 in China. The average machinery purchase in the top 5 origin cities is weighted using the migration flow. The reported standard errors in the parenthesis are heteroskedasticity-robust. Since time-variant lagged shares are used to construct the shift-share instrumental variable, the destination city fixed effects are included by first-differencing the variables and the shocks, as suggested by Borusyak et al. (2022).
+$^{*}$p$<$0.1; $^{**}$p$<$0.05; $^{***}$p$<$0.01.}"
+
+migration_result <- append(migration_result, notes, after = grep('center', migration_result)[3] )
+
+
+write(migration_result, file = paste0("communicating/tables/migration.tex"))
+
+```
+

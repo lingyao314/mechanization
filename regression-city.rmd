@@ -1,0 +1,491 @@
+---
+title: "City level regressions"
+author: Ling Yao
+date: 7/28/2022
+output: html_notebook
+---
+```{r, warning = F, message = F}
+library(dplyr)
+library(feather)
+library(AER)
+library(stargazer)
+library(readxl)
+m_list <- list("power", "tiller", "seeder", "harvester", "corn", "dryer")
+
+```
+
+```{r}
+# load outcome data
+top_cities <- c(3100,1100,4400,4403,5101,5000,3301,4201,3205,6101,3201,4301,1200,4101,4419,3702,5301,3302,3401,4406,2101,3202,3502,2102) # Cities to exclude, top tier cities by https://news.cctv.com/2023/05/30/ARTI5kyAHUzgByGH08lUpEQ4230530.shtml
+            # Shanghai, Beijing, Guangzhou, Shenzhen, Chengdu,Chongqin, Hangzhou, Wuhan, Suzhou, Xi'an, Nanjing, Changsha, Tianjin, Zhengzhou, Dongguan, Qingdao, Kunming, Ningbo, Hefei, Foshan, Shenyang, Wuxi, Xiamen, Dalian
+employment_city <- arrow::read_feather("dataprocessing/output/employment_city.feather") %>%
+  select(year, period, city_code, prv_code, nonag, manufacturing, construction, wholesaleretail, accommodationfood, logistic, industrial_firms) %>%
+  plm::make.pbalanced(., index = c("city_code", "year")) %>% # make it balanced so the lag is correctly missing when there is a gap in time
+    group_by(city_code) %>%
+    arrange(city_code, year) %>%
+  mutate(nonag_fd = nonag -  dplyr::lag(nonag),
+         manufacturing_fd = manufacturing - dplyr::lag(manufacturing),
+         construction_fd = construction - dplyr::lag(construction),
+         wholesaleretail_fd = wholesaleretail -dplyr::lag(wholesaleretail),
+         accommodationfood_fd = accommodationfood - dplyr::lag(accommodationfood),
+         logistic_fd = logistic - dplyr::lag(logistic),
+         industrial_firms_fd = industrial_firms -dplyr::lag(industrial_firms),
+         industrial_firms_lag = dplyr::lag(industrial_firms),
+         industrial_firms_lag_fd = industrial_firms_lag -dplyr::lag(industrial_firms_lag)
+       ) %>%
+  filter(year != 2020 & year >2014) %>%
+  filter(! city_code %in% top_cities)
+
+  ## the 2020 data is not available. The Chinese gov stopped reporting this information due to employment shocks in the Covid-19 pandemic.
+```
+```{r}
+# load additional falsification test data
+road_length <- read_excel("dataprocessing/output/road_length.xlsx") %>%
+    group_by(city_code) %>%
+    arrange(city_code, year) %>%
+    mutate(road_length = road_length/1000,
+           road_length_fd = road_length -  dplyr::lag(road_length))
+
+cropland <- read_excel("dataprocessing/output/cropland.xlsx") %>%
+    group_by(city_code) %>%
+    arrange(city_code, year) %>%
+    mutate(cropland_pixels_fd = cropland_pixels -  dplyr::lag(cropland_pixels))
+```
+```{r prepare-data, warning = F, message = F}
+for (m in 1:6){
+  # Load province level machinery subsidy data
+  shock <- arrow::read_feather(paste0("dataprocessing/output/", m_list[[m]], "/shock.feather")) %>%
+    mutate(prv_size = paste(prv_code, "-", size)) %>%
+    plm::make.pbalanced(., index = c("prv_size", "year")) %>% # make it balanced so the lag is correctly missing when there is a gap in time
+    group_by(prv_size) %>%
+    arrange(prv_size, year) %>%
+    mutate(subsidy = subsidy/1000,
+           subsidy_fd = subsidy - dplyr::lag(subsidy)) %>%
+    select(prv_code, prv_size, year, size, subsidy, retail_price, subsidy_rate, subsidy_fd)
+
+  # load city level machinery purchase data
+  city_year <- arrow::read_feather(paste0("dataprocessing/output/", m_list[[m]], "/city_year.feather"))%>%
+    plm::make.pbalanced(., index = c("city_code", "year")) %>% # make it balanced so the lag is correctly missing when there is a gap in time
+    group_by(city_code) %>%
+    arrange(city_code, year) %>%
+    mutate(purchase_fd = purchase - dplyr::lag(purchase)) %>%
+    mutate(year = as.factor(year)) %>%
+    select(city_code, year, purchase, purchase_fd)
+
+  # Load city-size level shares
+  city_year_size_shares <- arrow::read_feather(paste0("dataprocessing/output/", m_list[[m]], "/city_year_size_shares.feather"))
+
+  reg_data <- city_year_size_shares %>%
+    mutate(prv_code = substring(city_code, 0,2))%>%
+    merge(shock, by = c("prv_code", "year", "size"), all.x = TRUE) %>%
+    mutate(exposure_share_L1 = share_L1 * subsidy,
+           exposure_share0 = share0 * subsidy,
+           exposure_share_L1_fd = share_L1 * subsidy_fd,
+           exposure_share0_fd = share0 * subsidy_fd)%>%
+    group_by(city_code, year) %>%
+    summarise(ssiv_share_L1 = sum(exposure_share_L1, na.rm=T),
+              ssiv_share_L1_fd = sum(exposure_share_L1_fd, na.rm=T),
+              NAshares = sum(share_L1, na.rm = T),
+              ssiv_share0 = sum(exposure_share0, na.rm=T),
+              ssiv_share0_fd = sum(exposure_share0_fd, na.rm=T),
+              NAshares0 = sum(share0, na.rm = T))  %>% # # citie with no purchase records
+    mutate(ssiv_share_L1 = replace(ssiv_share_L1, NAshares ==0, NA),
+           ssiv_share_L1_fd = replace(ssiv_share_L1_fd, NAshares ==0, NA),
+          ssiv_share0 = replace(ssiv_share0, NAshares0 ==0, NA),
+           ssiv_share0_fd = replace(ssiv_share0_fd, NAshares0 ==0, NA)) %>%
+    merge(city_year, by = c("city_code", "year"), all.x = T, all.y = T) %>%
+    merge(employment_city, by = c("city_code", "year")) %>%
+    mutate(year = as.factor(year)) %>%
+    filter(!if_any(c(nonag_fd, manufacturing_fd,construction_fd, wholesaleretail_fd, accommodationfood_fd, logistic_fd, purchase_fd, ssiv_share_L1_fd), is.na)) %>% distinct(city_code, year,  .keep_all = T)
+
+  ols <-   lfe::felm(nonag ~ 1 + purchase | 0 | 0| city_code , data= reg_data )
+  tsls <- lfe::felm(nonag ~ 1  | 0 | (purchase ~ ssiv_share_L1)| city_code , data= reg_data ) # 2SLS
+  tsls_tfe <- lfe::felm(nonag ~ 1  | year | (purchase ~ ssiv_share_L1)| city_code , data= reg_data ) # 2SLS with time FE
+  tsls_tfefd <- lfe::felm(nonag_fd ~ 1  | year | (purchase_fd  ~ ssiv_share_L1_fd )| city_code , data= reg_data )# 2SLS with time FE and FD
+  tsls_tfefd_share0 <- lfe::felm(nonag_fd ~ 1  | year | (purchase_fd  ~ ssiv_share0_fd )| city_code , data= reg_data )# 2SLS with time FE and FD
+  fal <- lfe::felm(industrial_firms_lag_fd ~ 1 + ssiv_share_L1_fd | year | 0| city_code , data= reg_data )
+  # Store the regression results
+  assign(m_list[[m]], list(ols = ols,
+                           tsls = tsls,
+                           tsls_tfe = tsls_tfe,
+                           tsls_tfefd = tsls_tfefd,
+                           fal = fal))
+
+
+}
+```
+# look into the first stage. Only the tractor has strong first stage.
+```{r}
+power$tsls_tfefd$stage1$rob.iv1fstat$purchase_fd[5]
+tiller$tsls_tfefd$stage1$rob.iv1fstat$purchase_fd[5]
+seeder$tsls_tfefd$stage1$rob.iv1fstat$purchase_fd[5]
+harvester$tsls_tfefd$stage1$rob.iv1fstat$purchase_fd[5]
+corn$tsls_tfefd$stage1$rob.iv1fstat$purchase_fd[5]
+dryer$tsls_tfefd$stage1$rob.iv1fstat$purchase_fd[5]
+```
+# Report the first stage results by machinery type
+
+```{r}
+fs_city_tfefd <- stargazer(power$tsls_tfefd$stage1, tiller$tsls_tfefd$stage1, seeder$tsls_tfefd$stage1, harvester$tsls_tfefd$stage1, corn$tsls_tfefd$stage1, dryer$tsls_tfefd$stage1,
+                                 title = "First stage estimates with machinery purchase subsidy exposure as the shift-share instrumental variable for machinery purchase",
+                                 align = TRUE,
+                                out = "regression/output/fs_city_tfefd.html",
+                                 out.header = TRUE,
+                                 dep.var.labels = c("Tractor", "Rotary tiller",  "Seeder,transplanter", "Grain harvester", "Corn harvester", "Grain dryer"),
+                                 dep.var.caption  = 'Dependent variable: Machinery purchase (in 1000)',
+                                 column.labels = c("Horsepower",
+                                                     "Width (m)",
+                                                     "Rows",
+                                                     "Speed (kg/s)",
+                                                     "Rows",
+                                                     "Capacity (ton/day)"),
+                                 covariate.labels = c('Shift-share IV = market shares $\\times$ subsidy (1000 yuan)'),
+                                 omit = c("Constant"),
+                                 ci = FALSE,
+                                 label = "fs_city_tfefd",
+                                font.size = "Huge",
+                                 df = FALSE,
+                                     add.lines = list(c("Montiel-Pflueger robust F stat. for weak instrument",
+                                                     formatC(power$tsls_tfefd$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f"),
+                                                      formatC(tiller$tsls_tfefd$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f"),
+                                                      formatC(seeder$tsls_tfefd$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f"),
+                                                      formatC(harvester$tsls_tfefd$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f"),
+                                                      formatC(corn$tsls_tfefd$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f"),
+                                                      formatC(dryer$tsls_tfefd$stage1$rob.iv1fstat$purchase_fd[5]), digits = 3, format = "f")
+                                                    )
+
+)
+```
+
+```{r}
+# adjustbox so it fits the page width
+
+fs_city_tfefd <- append(fs_city_tfefd, "\\begin{adjustbox}{width={1.2\\textwidth},totalheight={\\textheight},keepaspectratio,center}", after = grep("label", fs_city_tfefd)[1])
+fs_city_tfefd <- append(fs_city_tfefd, "\\end{adjustbox} \\end{center}", after = grep("tabular", fs_city_tfefd)[2])
+
+# edit dependent variable labels. stargazer thinks there is only one dep var becauses all the regressions has nonag_fd as lhs.
+fs_city_tfefd[grepl('Tractor', fs_city_tfefd)] <- "& \\multicolumn{1}{c}{Tractor} & \\multicolumn{1}{c}{Rotary tiller} & \\multicolumn{1}{c}{Seeder,transplanter} & \\multicolumn{1}{c}{Grain harvester} & \\multicolumn{1}{c}{Corn harvester} & \\multicolumn{1}{c}{Grain dryer} \\\\"
+
+# add footnote
+fs_city_tfefd[grepl('\\centering', fs_city_tfefd)] <- "\\begin{table}[!htbp]\\begin{center}"
+fs_city_tfefd[grepl('Note', fs_city_tfefd)] <- ""
+notes <- "\\footnotesize{\\textit{Notes:} This table reports the first stage estimates of the shift-share instrumental variable with city level data in year 2015 - 2019 from China. The shift-share instrumental variable measures the city's exposure to the machinery subsidy policy depending on the market shares in the previous year. The endogenous variable is the subsidized machinery purchase. The reported standard errors in the parenthesis are
+heteroskedasticity-robust and are clustered at the city level. The city FE is included by first-differencing the variables and the shocks, as suggested by Borusyak et al. (2022). The year FE are included using dummy variables.
+$^{*}$p$<$0.1; $^{**}$p$<$0.05; $^{***}$p$<$0.01.}"
+fs_city_tfefd <- append(fs_city_tfefd, notes, after = grep('center', fs_city_tfefd)[3] )
+
+write(fs_city_tfefd,file = paste0("communicating/tables/fs_city_tfefd.tex"))
+```
+
+
+
+# Use outcome in different sectors and tractor as the only treatment
+```{r}
+m <- 1
+  # Load province level machinery subsidy data
+  shock <- arrow::read_feather(paste0("dataprocessing/output/", m_list[[m]], "/shock.feather")) %>%
+    mutate(prv_size = paste(prv_code, "-", size)) %>%
+    plm::make.pbalanced(., index = c("prv_size", "year")) %>% # make it balanced so the lag is correctly missing when there is a gap in time
+    group_by(prv_size) %>%
+    arrange(prv_size, year) %>%
+    mutate(subsidy = subsidy/1000,
+           subsidy_fd = subsidy - dplyr::lag(subsidy)) %>%
+    select(prv_code, prv_size, year, size, subsidy, retail_price, subsidy_rate, subsidy_fd)
+
+  # load city level machinery purchase data
+  city_year <- arrow::read_feather(paste0("dataprocessing/output/", m_list[[m]], "/city_year.feather"))%>%
+    plm::make.pbalanced(., index = c("city_code", "year")) %>% # make it balanced so the lag is correctly missing when there is a gap in time
+    group_by(city_code) %>%
+    arrange(city_code, year) %>%
+    mutate(purchase_fd = purchase - dplyr::lag(purchase)) %>%
+    mutate(year = as.factor(year)) %>%
+    select(city_code, year, purchase, purchase_fd)
+
+  # Load city-size level shares
+  city_year_size_shares <- arrow::read_feather(paste0("dataprocessing/output/", m_list[[m]], "/city_year_size_shares.feather"))
+
+  reg_data <- city_year_size_shares %>%
+    mutate(prv_code = substring(city_code, 0,2))%>%
+    merge(shock, by = c("prv_code", "year", "size"), all.x = TRUE) %>%
+    mutate(exposure_share_L1 = share_L1 * subsidy,
+           exposure_share0 = share0 * subsidy,
+           exposure_share_L1_fd = share_L1 * subsidy_fd,
+           exposure_share0_fd = share0 * subsidy_fd)%>%
+    group_by(city_code, year) %>%
+    summarise(ssiv_share_L1 = sum(exposure_share_L1, na.rm=T),
+              ssiv_share_L1_fd = sum(exposure_share_L1_fd, na.rm=T),
+              NAshares = sum(share_L1, na.rm = T),
+              ssiv_share0 = sum(exposure_share0, na.rm=T),
+              ssiv_share0_fd = sum(exposure_share0_fd, na.rm=T),
+              NAshares0 = sum(share0, na.rm = T))  %>% # # citie with no purchase records
+    mutate(ssiv_share_L1 = replace(ssiv_share_L1, NAshares ==0, NA),
+           ssiv_share_L1_fd = replace(ssiv_share_L1_fd, NAshares ==0, NA),
+          ssiv_share0 = replace(ssiv_share0, NAshares0 ==0, NA),
+           ssiv_share0_fd = replace(ssiv_share0_fd, NAshares0 ==0, NA)) %>%
+    merge(city_year, by = c("city_code", "year"), all.x = T, all.y = T) %>%
+    merge(employment_city, by = c("city_code", "year")) %>%
+    mutate(year = as.factor(year)) %>%
+    filter(!if_any(c(nonag_fd, manufacturing_fd,construction_fd, wholesaleretail_fd, accommodationfood_fd, logistic_fd, purchase_fd, ssiv_share_L1_fd), is.na)) %>% distinct(city_code, year,  .keep_all = T)
+
+
+    tsls_tfefd_all <- lfe::felm(nonag_fd ~ 1  | year | (purchase_fd  ~ ssiv_share_L1_fd )| city_code , data= reg_data )# 2SLS with time FE and FD
+    tsls_tfefd_manufacturing <- lfe::felm(manufacturing_fd ~ 1  | year | (purchase_fd  ~ ssiv_share_L1_fd )| city_code, data= reg_data )# 2SLS with time FE and FD
+    tsls_tfefd_construction <- lfe::felm(construction_fd ~ 1  | year | (purchase_fd  ~ ssiv_share_L1_fd )| city_code , data= reg_data )# 2SLS with time FE and FD
+    tsls_tfefd_wholesaleretail <- lfe::felm(wholesaleretail_fd ~ 1  | year | (purchase_fd  ~ ssiv_share_L1_fd )| city_code , data= reg_data )# 2SLS with time FE and FD
+    tsls_tfefd_accommodationfood <- lfe::felm(accommodationfood_fd ~ 1  | year | (purchase_fd  ~ ssiv_share_L1_fd )| city_code , data= reg_data )# 2SLS with time FE and FD
+    tsls_tfefd_logistic <- lfe::felm(logistic_fd ~ 1  | year | (purchase_fd  ~ ssiv_share_L1_fd )| city_code, data= reg_data )# 2SLS with time FE and FD
+
+save(reg_data, file = "regression/input/bechmark_reg_obs_city.RData")
+
+```
+# Assemble the results into stargazer tables
+
+```{r}
+effect_at_the_mean <- c("Effect at the mean",
+                                               formatC(mean(reg_data$purchase)*tsls_tfefd_all$coefficients[1], digits = 3, format = "f"),
+                                               formatC(mean(reg_data$purchase)*tsls_tfefd_manufacturing$coefficients[1], digits = 3, format = "f"),
+                                               formatC(mean(reg_data$purchase)*tsls_tfefd_construction$coefficients[1], digits = 3, format = "f"),
+                                               formatC(mean(reg_data$purchase)*tsls_tfefd_wholesaleretail$coefficients[1], digits = 3, format = "f"),
+                                               formatC(mean(reg_data$purchase)*tsls_tfefd_accommodationfood$coefficients[1], digits = 3, format = "f"),
+                                               formatC(mean(reg_data$purchase)*tsls_tfefd_logistic$coefficients[1], digits = 3, format = "f")
+                                             )
+effect_at_the_mean_lb <- c(" ",
+                                               formatC(mean(reg_data$purchase)*(tsls_tfefd_all$coefficients[1] - 1.96*sqrt(tsls_tfefd_all$clustervcv)), digits = 3, format = "f"),
+                                               formatC(mean(reg_data$purchase)*(tsls_tfefd_manufacturing$coefficients[1] - 1.96*sqrt(tsls_tfefd_manufacturing$clustervcv)), digits = 3, format = "f"),
+                                               formatC(mean(reg_data$purchase)*(tsls_tfefd_construction$coefficients[1] - 1.96*sqrt(tsls_tfefd_construction$clustervcv)), digits = 3, format = "f"),
+                                               formatC(mean(reg_data$purchase)*(tsls_tfefd_wholesaleretail$coefficients[1] - 1.96*sqrt(tsls_tfefd_wholesaleretail$clustervcv)), digits = 3, format = "f"),
+                                               formatC(mean(reg_data$purchase)*(tsls_tfefd_accommodationfood$coefficients[1] - 1.96*sqrt(tsls_tfefd_accommodationfood$clustervcv)), digits = 3, format = "f"),
+                                               formatC(mean(reg_data$purchase)*(tsls_tfefd_logistic$coefficients[1] - 1.96*sqrt(tsls_tfefd_logistic$clustervcv)), digits = 3, format = "f"))
+effect_at_the_mean_ub <- c(" ",
+                                               formatC(mean(reg_data$purchase)*(tsls_tfefd_all$coefficients[1] + 1.96*sqrt(tsls_tfefd_all$clustervcv)), digits = 3, format = "f"),
+                                               formatC(mean(reg_data$purchase)*(tsls_tfefd_manufacturing$coefficients[1] + 1.96*sqrt(tsls_tfefd_manufacturing$clustervcv)), digits = 3, format = "f"),
+                                               formatC(mean(reg_data$purchase)*(tsls_tfefd_construction$coefficients[1] + 1.96*sqrt(tsls_tfefd_construction$clustervcv)), digits = 3, format = "f"),
+                                               formatC(mean(reg_data$purchase)*(tsls_tfefd_wholesaleretail$coefficients[1] + 1.96*sqrt(tsls_tfefd_wholesaleretail$clustervcv)), digits = 3, format = "f"),
+                                               formatC(mean(reg_data$purchase)*(tsls_tfefd_accommodationfood$coefficients[1] + 1.96*sqrt(tsls_tfefd_accommodationfood$clustervcv)), digits = 3, format = "f"),
+                                               formatC(mean(reg_data$purchase)*(tsls_tfefd_logistic$coefficients[1] + 1.96*sqrt(tsls_tfefd_logistic$clustervcv)), digits = 3, format = "f"))
+effect_at_the_mean_ci <- paste("[", effect_at_the_mean_lb, ",", effect_at_the_mean_ub, "]")
+effect_at_the_mean_ci[1] <- ""
+
+ss_city_tfefd <- stargazer(tsls_tfefd_all,
+                           tsls_tfefd_manufacturing,
+                           tsls_tfefd_construction,
+                           tsls_tfefd_wholesaleretail,
+                           tsls_tfefd_accommodationfood,
+                           tsls_tfefd_logistic,
+                           title = "2SLS estimation results for the effect of mechanization on employment by sector",
+                           align = TRUE,
+                           out = "regression/output/ss_city_tfefd.html",
+                           out.header = TRUE,
+                           column.labels = c("All non-ag sectors", "Manufacturing", "Construction",  "Wholesale and retail", "Hotel and food service", "Logistics"),
+                           dep.var.caption = 'Dependent variable: Employment by sector (1000 people)',
+                           dep.var.labels.include = F,
+                           covariate.labels = c("Tractor purchase (1000 horsepower)"),
+                           omit = c("Constant"),
+                           ci = FALSE,
+                           label = "ss_city_tfefd",
+                           font.size = "Huge",
+                           df = FALSE,
+                           omit.stat = c("adj.rsq", "rsq", "ser"),
+                           add.lines =  list(c("Mean employment (1000 people)",
+                                               formatC(mean(reg_data$nonag), digits = 3, format = "f"),
+                                               formatC(mean(reg_data$manufacturing), digits = 3, format = "f"),
+                                               formatC(mean(reg_data$construction), digits = 3, format = "f"),
+                                               formatC(mean(reg_data$wholesaleretail), digits = 3, format = "f"),
+                                               formatC(mean(reg_data$accommodationfood), digits = 3, format = "f"),
+                                               formatC(mean(reg_data$logistic), digits = 3, format = "f")),
+                                              effect_at_the_mean,
+                                              effect_at_the_mean_ci,
+                                             c("Montiel-Pflueger robust F stat",
+                                               formatC(tsls_tfefd_all$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f"),
+                                               formatC(tsls_tfefd_manufacturing$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f"),
+                                               formatC(tsls_tfefd_construction$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f"),
+                                               formatC(tsls_tfefd_wholesaleretail$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f"),
+                                               formatC(tsls_tfefd_accommodationfood$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f"),
+                                               formatC(tsls_tfefd_logistic$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f")))
+)
+```
+
+
+
+# adjustbox so it fits the page width
+```{r}
+ss_city_tfefd <- append(ss_city_tfefd, "\\begin{adjustbox}{width={1.2\\textwidth},totalheight={\\textheight},keepaspectratio,center}", after = grep("label", ss_city_tfefd)[1])
+ss_city_tfefd <- append(ss_city_tfefd, "\\end{adjustbox} \\end{center}", after = grep("tabular", ss_city_tfefd)[2])
+# add footnote
+ss_city_tfefd[grepl('\\centering', ss_city_tfefd)] <- "\\begin{table}[!htbp]\\begin{center}"
+ss_city_tfefd[grepl('Note', ss_city_tfefd)] <- ""
+notes <- "\\footnotesize{\\textit{Notes:} This table reports the two-stage least squares estimates on the effect of subsidized tractor purchase on employment in all secondary and tertiary sectors and the 5 sectors with the largest rural workers representation with city level data in year 2015 - 2019 from China. 24 Highly urbanized cities with little agriculture and large migration inflow are excluded. The shift-share instrumental variable measures the city's exposure to the machinery subsidy policy depending on the market shares in the previous year. The endogenous variable is the subsidized machinery purchase. The reported standard errors in the parenthesis are
+heteroskedasticity-robust and are clustered at the city level. The city fixed effects are included by first-differencing the variables and the shocks, as suggested by Borusyak et al. (2022). The year fixed effects are included as dummy variables.
+$^{*}$p$<$0.1; $^{**}$p$<$0.05; $^{***}$p$<$0.01.}"
+ss_city_tfefd <- append(ss_city_tfefd, notes, after = grep('center', ss_city_tfefd)[3] )
+
+write(ss_city_tfefd, file = paste0("communicating/tables/ss_city_tfefd.tex"))
+
+
+```
+# Results using baseline shares
+```{r}
+    tsls_tfefd_all_share0 <- lfe::felm(nonag_fd ~ 1  | year | (purchase_fd  ~ ssiv_share0_fd )| city_code , data= reg_data )# 2SLS with time FE and FD
+    tsls_tfefd_manufacturing_share0 <- lfe::felm(manufacturing_fd ~ 1  | year | (purchase_fd  ~ ssiv_share0_fd )| city_code, data= reg_data )# 2SLS with time FE and FD
+    tsls_tfefd_construction_share0 <- lfe::felm(construction_fd ~ 1  | year | (purchase_fd  ~ ssiv_share0_fd )| city_code , data= reg_data )# 2SLS with time FE and FD
+    tsls_tfefd_wholesaleretail_share0 <- lfe::felm(wholesaleretail_fd ~ 1  | year | (purchase_fd  ~ ssiv_share0_fd )| city_code , data= reg_data )# 2SLS with time FE and FD
+    tsls_tfefd_accommodationfood_share0 <- lfe::felm(accommodationfood_fd ~ 1  | year | (purchase_fd  ~ ssiv_share0_fd )| city_code , data= reg_data )# 2SLS with time FE and FD
+    tsls_tfefd_logistic_share0 <- lfe::felm(logistic_fd ~ 1  | year | (purchase_fd  ~ ssiv_share0_fd )| city_code, data= reg_data )# 2SLS with time FE and FD
+
+ss_city_tfefd <- stargazer(tsls_tfefd_all_share0,
+                           tsls_tfefd_manufacturing_share0,
+                           tsls_tfefd_construction_share0,
+                           tsls_tfefd_wholesaleretail_share0,
+                           tsls_tfefd_accommodationfood_share0,
+                           tsls_tfefd_logistic_share0,
+                           title = "2SLS estimation results for the effect of mechanization on employment by sector (baseline shares)",
+                           align = TRUE,
+                           out = "regression/output/ss_city_tfefd_share0.html",
+                           out.header = TRUE,
+                           column.labels = c("All non-ag sectors", "Manufacturing", "Construction",  "Wholesale and retail", "Hotel and food service", "Logistics"),
+                           dep.var.caption = 'Dependent variable: Employment by sector (1000 people)',
+                           dep.var.labels.include = F,
+                           covariate.labels = c("Tractor purchase (1000 horsepower)"),
+                           omit = c("Constant"),
+                           ci = FALSE,
+                           label = "ss_city_tfefd_share0",
+                           font.size = "Huge",
+                           df = FALSE,
+                           omit.stat = c("adj.rsq", "rsq", "ser"),
+                           add.lines =  list(c("Montiel-Pflueger robust F stat",
+                                               formatC(tsls_tfefd_all_share0$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f"),
+                                               formatC(tsls_tfefd_manufacturing_share0$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f"),
+                                               formatC(tsls_tfefd_construction_share0$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f"),
+                                               formatC(tsls_tfefd_wholesaleretail_share0$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f"),
+                                               formatC(tsls_tfefd_accommodationfood_share0$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f"),
+                                               formatC(tsls_tfefd_logistic_share0$stage1$rob.iv1fstat$purchase_fd[5], digits = 3, format = "f")))
+)
+
+```
+# Falsification test: lagged number of industrial firms as proxy for non-ag labor demand
+```{r}
+  ols <-   lfe::felm(industrial_firms_lag ~ 1 + ssiv_share_L1 | 0 | 0| city_code , data= reg_data )
+  tfe <-  lfe::felm(industrial_firms_lag ~ 1 + ssiv_share_L1 | year | 0| city_code , data= reg_data )
+  fd <- lfe::felm(industrial_firms_lag_fd ~ 1 + ssiv_share_L1_fd | 0 | 0| city_code , data= reg_data )
+  tfefd <- lfe::felm(industrial_firms_lag_fd ~ 1 + ssiv_share_L1_fd | year | 0| city_code , data= reg_data )
+```
+```{r}
+falsification_test <- stargazer(ols, tfe, fd, tfefd,
+                                title = "Falsification test results",
+                           align = TRUE,
+                           out = "regression/output/fal_city.html",
+                           out.header = TRUE,
+                           column.labels = c("OLS", "Time FE", "First Difference",  "Time FE + FD"),
+                           dep.var.caption = 'Dependent variable: Number of industrial firms in the previous year',
+                           dep.var.labels.include = F,
+                           covariate.labels = c("Shift-Share IV", "Shift-Share IV with first-differenced shocks"),
+                           omit = c("Constant"),
+                           ci = FALSE,
+                           label = "fal_city",
+                           font.size = "Huge",
+                           df = FALSE
+                           )
+```
+```{r}
+# adjustbox so it fits the page width
+
+falsification_test <- append(falsification_test, "\\begin{adjustbox}{width={1.2\\textwidth},totalheight={\\textheight},keepaspectratio,center}", after = grep("label", falsification_test)[1])
+falsification_test <- append(falsification_test, "\\end{adjustbox} \\end{center}", after = grep("tabular", falsification_test)[2])
+
+
+# add footnote
+falsification_test[grepl('\\centering', falsification_test)] <- "\\begin{table}[!htbp]\\begin{center}"
+falsification_test[grepl('Note', falsification_test)] <- ""
+notes <- "\\footnotesize{\\textit{Notes:} This table reports the falsification test for the shift-share instrumental variable using the number of industrial firms (including manufacturing and mining) as a proxy for non-agricultural labor demand in the city when the subsidy levels are assigned by the provincial governments.
+$^{*}$p$<$0.1; $^{**}$p$<$0.05; $^{***}$p$<$0.01.}"
+falsification_test <- append(falsification_test, notes, after = grep('center', falsification_test)[3] )
+
+write(falsification_test,file = paste0("communicating/tables/fal_city.tex"))
+
+```
+
+# Additional Falsification test: road length as proxy for infrastructure investment
+```{r}
+reg_data <- merge(reg_data, road_length, by = c("city_code", "year"), all.x = T, all.y = F)
+  ols <-   lfe::felm(road_length ~ 1 + ssiv_share_L1 | 0 | 0| city_code , data= reg_data )
+  tfe <-  lfe::felm(road_length ~ 1 + ssiv_share_L1 | year | 0| city_code , data= reg_data )
+  fd <- lfe::felm(road_length_fd ~ 1 + ssiv_share_L1_fd | 0 | 0| city_code , data= reg_data )
+  tfefd <- lfe::felm(road_length_fd ~ 1 + ssiv_share_L1_fd | year | 0| city_code , data= reg_data )
+```
+```{r}
+falsification_test <- stargazer(ols, tfe, fd, tfefd,
+                                title = "Falsification test results",
+                           align = TRUE,
+                           out = "regression/output/fal_city_add1.html",
+                           out.header = TRUE,
+                           column.labels = c("OLS", "Time FE", "First Difference",  "Time FE + FD"),
+                           dep.var.caption = 'Dependent variable: Total road length (m)',
+                           dep.var.labels.include = F,
+                           covariate.labels = c("Shift-Share IV", "Shift-Share IV with first-differenced shocks"),
+                           omit = c("Constant"),
+                           ci = FALSE,
+                           label = "fal_city_add1",
+                           font.size = "Huge",
+                           df = FALSE
+                           )
+```
+```{r}
+# adjustbox so it fits the page width
+
+falsification_test <- append(falsification_test, "\\begin{adjustbox}{width={1.2\\textwidth},totalheight={\\textheight},keepaspectratio,center}", after = grep("label", falsification_test)[1])
+falsification_test <- append(falsification_test, "\\end{adjustbox} \\end{center}", after = grep("tabular", falsification_test)[2])
+
+
+# add footnote
+falsification_test[grepl('\\centering', falsification_test)] <- "\\begin{table}[!htbp]\\begin{center}"
+falsification_test[grepl('Note', falsification_test)] <- ""
+notes <- "\\footnotesize{\\textit{Notes:} This table reports the falsification test for the shift-share instrumental variable using the total road length as a proxy for infrascture investment in the city at the begining of the year.
+$^{*}$p$<$0.1; $^{**}$p$<$0.05; $^{***}$p$<$0.01.}"
+falsification_test <- append(falsification_test, notes, after = grep('center', falsification_test)[3] )
+
+write(falsification_test,file = paste0("communicating/tables/fal_city_add1.tex"))
+
+```
+
+# Additional Falsification test: land use changes
+```{r}
+reg_data <- merge(reg_data, cropland, by = c("city_code", "year"), all.x = T, all.y = F)
+  ols <-   lfe::felm(cropland_pixels ~ 1 + ssiv_share_L1 | 0 | 0| city_code , data= reg_data )
+  tfe <-  lfe::felm(cropland_pixels ~ 1 + ssiv_share_L1 | year | 0| city_code , data= reg_data )
+  fd <- lfe::felm(cropland_pixels_fd ~ 1 + ssiv_share_L1_fd | 0 | 0| city_code , data= reg_data )
+  tfefd <- lfe::felm(cropland_pixels_fd ~ 1 + ssiv_share_L1_fd | year | 0| city_code , data= reg_data )
+```
+```{r}
+falsification_test <- stargazer(ols, tfe, fd, tfefd,
+                                title = "Falsification test results",
+                           align = TRUE,
+                           out = "regression/output/fal_city_add2.html",
+                           out.header = TRUE,
+                           column.labels = c("OLS", "Time FE", "First Difference",  "Time FE + FD"),
+                           dep.var.caption = 'Dependent variable: Number of raster pixels identified as cropland',
+                           dep.var.labels.include = F,
+                           covariate.labels = c("Shift-Share IV", "Shift-Share IV with first-differenced shocks"),
+                           omit = c("Constant"),
+                           ci = FALSE,
+                           label = "fal_city_add2",
+                           font.size = "Huge",
+                           df = FALSE
+                           )
+```
+```{r}
+# adjustbox so it fits the page width
+
+falsification_test <- append(falsification_test, "\\begin{adjustbox}{width={1.2\\textwidth},totalheight={\\textheight},keepaspectratio,center}", after = grep("label", falsification_test)[1])
+falsification_test <- append(falsification_test, "\\end{adjustbox} \\end{center}", after = grep("tabular", falsification_test)[2])
+
+
+# add footnote
+falsification_test[grepl('\\centering', falsification_test)] <- "\\begin{table}[!htbp]\\begin{center}"
+falsification_test[grepl('Note', falsification_test)] <- ""
+notes <- "\\footnotesize{\\textit{Notes:} This table reports the falsification test for the shift-share instrumental variable using cropland acrea. Cropland area is measured by the number of satellite image pixels (300m resolution) identifed as rainfed or irrigated cropland by the European Space Agency.
+$^{*}$p$<$0.1; $^{**}$p$<$0.05; $^{***}$p$<$0.01.}"
+falsification_test <- append(falsification_test, notes, after = grep('center', falsification_test)[3] )
+
+write(falsification_test,file = paste0("communicating/tables/fal_city_add2.tex"))
+
+```

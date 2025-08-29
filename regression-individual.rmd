@@ -1,0 +1,83 @@
+---
+title: "R Notebook"
+author: yaoan
+date: 10/30/2022
+output: html_notebook
+---
+```{r, warning = F, message = F}
+library(dplyr)
+library(feather)
+library(AER)
+library(stargazer)
+library(plm)
+library(ggplot2)
+library(readstata13)
+library(haven)
+
+# load outcome data
+employment_gen1 <- arrow::read_feather(paste0("dataprocessing/output/employment_gen1.feather")) %>%
+        group_by(ID) %>%
+        arrange(ID, year)
+
+
+agland_city <- read.dta13('regression/input/city_agland.dta') # use city_agland generated from 'C:/Users/yaoan/OneDrive/解压数据/1998～2020年中国城市统计年鉴地级市面板数据.dta', the data is as of 2007, unit is 1000 ha
+
+```
+```{r}
+m_list <- list("power", "tiller", "seeder", "harvester", "corn", "dryer")
+m <- 1 # focus on tractors
+
+  # load city level machinery purchase data
+  city_year <- arrow::read_feather(paste0("dataprocessing/output/", m_list[[m]], "/city_year.feather"))%>%   filter(year == 2015 | year ==2018) %>%
+    select(city_code, year, purchase) %>%
+    merge(agland_city, by = "city_code") %>%
+    mutate(purchase = purchase/agland)
+
+  reg_data <- city_year %>%
+    merge(employment_gen1, by = c("city_code", "year")) %>%
+    mutate(year = as.factor(year)) %>%
+    mutate(demo_group = case_when(
+                            male == 1 & age <61 ~ "working age male",
+                            male == 1 & age >60 ~ "elderly male",
+                            male == 0 & age <61 ~ "working age female",
+                            male == 0 & age >60 ~ "elderly female"))
+
+reg_data$demo_group <- relevel(factor(reg_data$demo_group), ref = "working age male")
+
+  workag <- lfe::felm(workag ~ 1 + purchase*demo_group | city_code + year | 0 | city_code , data= reg_data )
+  agworkself <- lfe::felm(agworkself ~ 1 + purchase*demo_group | city_code + year | 0 | city_code , data= reg_data )
+  agworkhired <- lfe::felm(agworkhired ~ 1 + purchase*demo_group | city_code + year | 0 | city_code , data= reg_data )
+  worknonag <- lfe::felm(worknonag ~ 1 + purchase*demo_group | city_code + year | 0 | city_code , data= reg_data )
+  liverural <- lfe::felm(liverural ~ 1 + purchase*demo_group | city_code + year | 0 | city_code , data= reg_data )
+
+write_dta(reg_data, "regression/input/individual_data.dta") # use this to run estimate the average marginal effect in Stata
+```
+```{r}
+individual_tfecfe <- stargazer(workag, agworkhired, agworkself, worknonag,
+          title = "Linear probability model regression results for individual employment status",
+          align = TRUE,
+          out = "regression/output/individual_tfecfe.html",
+          out.header = TRUE,
+          dep.var.labels = c("Working in agriculture", "Working in agriculture, hired",  "Working on own farm", "Working in non-agriculture jobs"),
+          dep.var.caption = "Dependent variable: Binary variables for",
+          covariate.labels = c('Tractor purchase per ha of agricultural land (horsepower)', 'Tractor purchase $\\times$ elderly women', 'Tractor purchase $\\times$ elderly men', 'Tractor purchase $\\times$ working age women', 'Elderly women', 'Elderly men', 'Working age women'),
+          order = c("purchase"),
+          label = "individual_tfecfe",
+          font.size = "Huge") # Postestimation from Stata using "margins demo_group, dydx(purchase)"
+```
+```{r}
+# adjustbox so it fits the page width
+
+individual_tfecfe <- append(individual_tfecfe, "\\begin{adjustbox}{width={1.2\\textwidth},totalheight={\\textheight},keepaspectratio,center}", after = grep("label", individual_tfecfe)[1])
+individual_tfecfe <- append(individual_tfecfe, "\\end{adjustbox} \\end{center}", after = grep("tabular", individual_tfecfe)[2])
+
+# add footnote
+individual_tfecfe[grepl('\\centering', individual_tfecfe)] <- "\\begin{table}[!htbp]\\begin{center}"
+individual_tfecfe[grepl('Note', individual_tfecfe)] <- ""
+notes <- "\\footnotesize{\\textit{Notes:} City fixed effect and year fixed effect are included in all four regressions. The reported standard errors in the parenthesis are heteroskedasticity-robust and are clustered at the city level. The individual employment status information is from the CHARLS survey waves 2015 and 2018. The observations are from a sample subset of rural households with access to farm land and individuals below 70 years old. Individuals no more than 60 years old are classified as working age. Individuals above 60 years old are classified as elderly.
+$^{*}$p$<$0.1; $^{**}$p$<$0.05; $^{***}$p$<$0.01.}"
+individual_tfecfe <- append(individual_tfecfe, notes, after = grep('center', individual_tfecfe)[3] )
+
+write(individual_tfecfe,file = paste0("communicating/tables/individual_tfecfe.tex"))
+
+```
